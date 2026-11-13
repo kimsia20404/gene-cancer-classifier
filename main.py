@@ -1,11 +1,15 @@
-   
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import requests
+import zipfile
+import io
+import warnings
 
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.decomposition import PCA
@@ -19,8 +23,6 @@ from sklearn.metrics import (
     classification_report
 )
 
-from pathlib import Path
-import io
 
 # --------------------------------------------------
 # 1. 기본 설정
@@ -43,6 +45,7 @@ st.markdown("""
 성능을 평가하는 교육용 프로젝트입니다.
 """)
 
+
 # --------------------------------------------------
 # 2. 암 종류 한글 이름
 # --------------------------------------------------
@@ -61,24 +64,87 @@ def friendly_class(value):
 
 
 # --------------------------------------------------
-# 3. 데이터 읽기
+# 3. 데이터 자동 다운로드 및 읽기
 # --------------------------------------------------
 
-@st.cache_data
-def load_data(data_bytes, labels_bytes):
+DATA_URL = (
+    "https://aicampusbucket.s3.us-west-1.amazonaws.com/"
+    "uploads/files/Cancer_Subtype_Multi-Class.zip"
+)
 
-    data = pd.read_csv(io.BytesIO(data_bytes))
-    labels = pd.read_csv(io.BytesIO(labels_bytes))
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_data():
+
+    # ZIP 파일 다운로드
+    response = requests.get(
+        DATA_URL,
+        timeout=300
+    )
+
+    response.raise_for_status()
+
+    # ZIP 파일 열기
+    zip_buffer = io.BytesIO(response.content)
+
+    with zipfile.ZipFile(zip_buffer, "r") as z:
+
+        file_names = z.namelist()
+
+        # 압축 파일 안에서 CSV 찾기
+        data_name = next(
+            (
+                name for name in file_names
+                if name.lower().endswith("data.csv")
+            ),
+            None
+        )
+
+        labels_name = next(
+            (
+                name for name in file_names
+                if name.lower().endswith("labels.csv")
+            ),
+            None
+        )
+
+        if data_name is None:
+            raise FileNotFoundError(
+                "압축 파일에서 data.csv를 찾을 수 없습니다."
+            )
+
+        if labels_name is None:
+            raise FileNotFoundError(
+                "압축 파일에서 labels.csv를 찾을 수 없습니다."
+            )
+
+        # CSV 읽기
+        data = pd.read_csv(z.open(data_name))
+        labels = pd.read_csv(z.open(labels_name))
 
     # Sample 열 이름 확인
     if "Sample" not in data.columns:
-        data = data.rename(columns={data.columns[0]: "Sample"})
+        data = data.rename(
+            columns={data.columns[0]: "Sample"}
+        )
 
     if "Sample" not in labels.columns:
-        labels = labels.rename(columns={labels.columns[0]: "Sample"})
+        labels = labels.rename(
+            columns={labels.columns[0]: "Sample"}
+        )
 
     # 두 파일 연결
-    df = pd.merge(data, labels, on="Sample", how="inner")
+    df = pd.merge(
+        data,
+        labels,
+        on="Sample",
+        how="inner"
+    )
+
+    if "Class" not in df.columns:
+        raise ValueError(
+            "labels.csv에서 Class 열을 찾을 수 없습니다."
+        )
 
     # 유전자 열 찾기
     gene_cols = [
@@ -86,106 +152,86 @@ def load_data(data_bytes, labels_bytes):
         if str(col).startswith("gene_")
     ]
 
-    # 유전자 값 숫자로 변환
+    if len(gene_cols) == 0:
+        raise ValueError(
+            "gene_으로 시작하는 유전자 열을 찾을 수 없습니다."
+        )
+
+    # 유전자 발현량을 숫자로 변환
     for col in gene_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce"
+        )
 
     df["Class"] = df["Class"].astype(str).str.strip()
+
+    # 정답이 없는 행 제거
+    df = df.dropna(subset=["Class"]).reset_index(drop=True)
+
+    # 모두 결측인 유전자 열 제외
+    gene_cols = [
+        col for col in gene_cols
+        if df[col].notna().any()
+    ]
 
     return df, gene_cols
 
 
 # --------------------------------------------------
-# 4. 데이터 업로드
+# 4. 데이터 자동 불러오기
 # --------------------------------------------------
 
 st.sidebar.header("📂 데이터 준비")
 
-st.sidebar.write(
-    "data.csv와 labels.csv를 각각 업로드해 주세요."
+st.sidebar.info(
+    "공개 데이터 저장소에서 데이터를 자동으로 불러옵니다."
 )
-
-data_file = st.sidebar.file_uploader(
-    "data.csv 업로드",
-    type=["csv"],
-    key="data_upload"
-)
-
-labels_file = st.sidebar.file_uploader(
-    "labels.csv 업로드",
-    type=["csv"],
-    key="labels_upload"
-)
-
-if data_file is None or labels_file is None:
-
-    st.info(
-        "왼쪽 메뉴에서 data.csv와 labels.csv를 모두 업로드하면 "
-        "분석이 시작됩니다."
-    )
-
-    # GitHub 저장소에 파일이 있을 경우 자동 읽기
-    if Path("data.csv").exists() and Path("labels.csv").exists():
-
-        data_bytes = Path("data.csv").read_bytes()
-        labels_bytes = Path("labels.csv").read_bytes()
-
-    else:
-        st.warning(
-            "데이터 파일이 아직 준비되지 않았습니다. "
-            "두 CSV 파일을 업로드해 주세요."
-        )
-        st.stop()
-
-else:
-    data_bytes = data_file.getvalue()
-    labels_bytes = labels_file.getvalue()
-
-
-# --------------------------------------------------
-# 5. 데이터 불러오기 및 전처리
-# --------------------------------------------------
 
 try:
 
-    df, gene_cols = load_data(data_bytes, labels_bytes)
+    with st.spinner(
+        "🧬 유전자 발현 데이터를 다운로드하고 있습니다. 잠시 기다려 주세요."
+    ):
+
+        df, gene_cols = load_data()
+
+    st.sidebar.success("데이터 자동 불러오기 완료!")
 
 except Exception as e:
 
-    st.error(f"데이터를 읽는 중 오류가 발생했습니다: {e}")
-    st.stop()
-
-
-if "Class" not in df.columns or len(gene_cols) == 0:
     st.error(
-        "데이터 구조를 확인할 수 없습니다. "
-        "data.csv와 labels.csv의 열 이름을 확인해 주세요."
+        "데이터를 불러오는 중 오류가 발생했습니다."
     )
+
+    st.error(str(e))
+
+    st.info(
+        "인터넷 연결을 확인한 뒤 다시 접속해 주세요. "
+        "문제가 계속되면 관리자에게 알려 주세요."
+    )
+
     st.stop()
 
 
-# 실제 암 종류 확인
+# --------------------------------------------------
+# 5. 데이터 전처리
+# --------------------------------------------------
+
 classes = sorted(df["Class"].dropna().unique())
 
 if len(classes) != 5:
+
     st.warning(
         f"현재 데이터에서 {len(classes)}개 암 종류가 발견되었습니다. "
         "원본 데이터가 모두 포함되었는지 확인해 주세요."
     )
 
-
-# Sample ID 제외하고 유전자만 사용
+# Sample ID는 모델 입력에서 제외
 id_col = "Sample"
 
 X = df[gene_cols].copy()
 y = df["Class"].copy()
-
-# 결측치 제거: 정답이 없는 행만 제거
-valid = y.notna()
-
-X = X.loc[valid].reset_index(drop=True)
-y = y.loc[valid].reset_index(drop=True)
-df = df.loc[valid].reset_index(drop=True)
 
 # 모두 결측인 유전자 열 제외
 gene_cols = [
@@ -193,7 +239,13 @@ gene_cols = [
     if X[col].notna().any()
 ]
 
-X = X[gene_cols]
+X = X[gene_cols].copy()
+
+# 인덱스 정리
+X = X.reset_index(drop=True)
+y = y.reset_index(drop=True)
+df = df.reset_index(drop=True)
+
 
 # --------------------------------------------------
 # 6. 세션 상태
@@ -211,18 +263,35 @@ if "models_ready" not in st.session_state:
 # --------------------------------------------------
 
 st.divider()
+
 st.header("📊 데이터 기본 정보")
 
 c1, c2, c3, c4 = st.columns(4)
 
-c1.metric("전체 샘플 수", f"{len(df):,}개")
-c2.metric("유전자 수", f"{len(gene_cols):,}개")
-c3.metric("암 종류 수", f"{len(classes)}개")
-c4.metric("결측 정답 수", f"{df['Class'].isna().sum()}개")
+c1.metric(
+    "전체 샘플 수",
+    f"{len(df):,}개"
+)
+
+c2.metric(
+    "유전자 수",
+    f"{len(gene_cols):,}개"
+)
+
+c3.metric(
+    "암 종류 수",
+    f"{len(classes)}개"
+)
+
+c4.metric(
+    "결측 정답 수",
+    f"{df['Class'].isna().sum()}개"
+)
 
 st.caption(
     "Sample은 샘플 식별자이며, 유전자 발현량만 모델의 입력 변수로 사용합니다."
 )
+
 
 # --------------------------------------------------
 # 8. 탭 구성
@@ -253,7 +322,10 @@ with tab1:
         .reset_index()
     )
 
-    class_counts.columns = ["암 종류 코드", "샘플 수"]
+    class_counts.columns = [
+        "암 종류 코드",
+        "샘플 수"
+    ]
 
     class_counts["암 종류"] = (
         class_counts["암 종류 코드"].map(friendly_class)
@@ -268,7 +340,10 @@ with tab1:
         title="암 종류별 데이터 분포"
     )
 
-    st.plotly_chart(fig_count, use_container_width=True)
+    st.plotly_chart(
+        fig_count,
+        use_container_width=True
+    )
 
     st.caption(
         "암 종류마다 샘플 수가 다르므로 데이터 불균형 여부를 확인할 수 있습니다."
@@ -278,7 +353,9 @@ with tab1:
 
     st.subheader("데이터 미리보기")
 
-    preview = df[["Sample", "Class"] + gene_cols[:8]]
+    preview = df[
+        ["Sample", "Class"] + gene_cols[:8]
+    ]
 
     st.dataframe(
         preview.head(10),
@@ -286,7 +363,8 @@ with tab1:
     )
 
     st.caption(
-        "전체 유전자 중 일부 열만 화면에 표시합니다. 실제 분석에는 전체 유전자 데이터를 사용합니다."
+        "전체 유전자 중 일부 열만 화면에 표시합니다. "
+        "실제 분석에는 전체 유전자 데이터를 사용합니다."
     )
 
     st.divider()
@@ -295,7 +373,10 @@ with tab1:
 
     missing = X.isna().sum().sum()
 
-    st.metric("유전자 발현량 결측값", f"{missing:,}개")
+    st.metric(
+        "유전자 발현량 결측값",
+        f"{missing:,}개"
+    )
 
     st.write("암 종류별 샘플 수")
 
@@ -322,10 +403,12 @@ with tab2:
         index=0
     )
 
-    box_df = df[["Class", selected_gene]].dropna().copy()
+    box_df = df[
+        ["Class", selected_gene]
+    ].dropna().copy()
 
     box_df["암 종류"] = box_df["Class"].map(
-        lambda x: friendly_class(x)
+        friendly_class
     )
 
     fig_gene = px.box(
@@ -337,7 +420,9 @@ with tab2:
         title=f"{selected_gene} 발현량의 암 종류별 분포"
     )
 
-    fig_gene.update_layout(showlegend=False)
+    fig_gene.update_layout(
+        showlegend=False
+    )
 
     st.plotly_chart(
         fig_gene,
@@ -358,25 +443,25 @@ with tab2:
 
     if len(X) >= 2:
 
-        pca_input = SimpleImputer(
-            strategy="median"
-        ).fit_transform(X)
+        with st.spinner("PCA 그래프를 계산하고 있습니다..."):
 
-        pca_scaled = StandardScaler().fit_transform(
-            pca_input
-        )
+            pca_input = SimpleImputer(
+                strategy="median"
+            ).fit_transform(X)
 
-        coords = PCA(
-            n_components=2,
-            random_state=42
-        ).fit_transform(pca_scaled)
+            pca_scaled = StandardScaler().fit_transform(
+                pca_input
+            )
+
+            coords = PCA(
+                n_components=2,
+                random_state=42
+            ).fit_transform(pca_scaled)
 
         pca_df = pd.DataFrame({
             "주성분 1": coords[:, 0],
             "주성분 2": coords[:, 1],
-            "암 종류": y.map(
-                lambda x: friendly_class(x)
-            )
+            "암 종류": y.map(friendly_class)
         })
 
         fig_pca = px.scatter(
@@ -394,11 +479,15 @@ with tab2:
         )
 
         st.caption(
-            "점들이 암 종류별로 모이는지 확인합니다. 가까이 모인다고 해서 임상 진단이 가능하다는 뜻은 아닙니다."
+            "점들이 암 종류별로 모이는지 확인합니다. "
+            "가까이 모인다고 해서 임상 진단이 가능하다는 뜻은 아닙니다."
         )
 
     else:
-        st.warning("PCA를 실행하기에 샘플 수가 부족합니다.")
+
+        st.warning(
+            "PCA를 실행하기에 샘플 수가 부족합니다."
+        )
 
 
 # ==================================================
@@ -426,7 +515,8 @@ with tab3:
     )
 
     st.caption(
-        "선택한 유전자 수만큼 학습 데이터에서 중요한 특성을 고릅니다. 테스트 데이터는 학습 과정에 사용하지 않습니다."
+        "선택한 유전자 수만큼 학습 데이터에서 중요한 특성을 고릅니다. "
+        "테스트 데이터는 학습 과정에 사용하지 않습니다."
     )
 
     if st.button(
@@ -446,24 +536,30 @@ with tab3:
 
         if st.session_state["model_results"] is None:
 
-            with st.spinner("두 모델을 학습하고 있습니다..."):
+            with st.spinner(
+                "두 모델을 학습하고 있습니다..."
+            ):
 
                 try:
 
-                    # 모델 학습용 함수
-                    def train_models(X, y, k):
+                    # 학습용 데이터와 테스트용 데이터 나누기
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X,
+                        y,
+                        test_size=0.2,
+                        random_state=42,
+                        stratify=y
+                    )
 
-                        X_train, X_test, y_train, y_test = train_test_split(
-                            X,
-                            y,
-                            test_size=0.2,
-                            random_state=42,
-                            stratify=y
-                        )
+                    k_actual = min(
+                        k,
+                        X.shape[1]
+                    )
 
-                        k_actual = min(k, X.shape[1])
+                    # 모델별로 독립적인 전처리 파이프라인 생성
+                    models = {
 
-                        common_steps = [
+                        "로지스틱 회귀": Pipeline([
                             (
                                 "imputer",
                                 SimpleImputer(strategy="median")
@@ -474,73 +570,85 @@ with tab3:
                                     score_func=f_classif,
                                     k=k_actual
                                 )
-                            )
-                        ]
-
-                        models = {
-                            "로지스틱 회귀": Pipeline(
-                                common_steps + [
-                                    ("scaler", StandardScaler()),
-                                    (
-                                        "model",
-                                        LogisticRegression(
-                                            max_iter=3000,
-                                            class_weight="balanced"
-                                        )
-                                    )
-                                ]
                             ),
-
-                            "랜덤 포레스트": Pipeline(
-                                common_steps + [
-                                    (
-                                        "model",
-                                        RandomForestClassifier(
-                                            n_estimators=200,
-                                            random_state=42,
-                                            class_weight="balanced",
-                                            n_jobs=-1
-                                        )
-                                    )
-                                ]
+                            (
+                                "scaler",
+                                StandardScaler()
+                            ),
+                            (
+                                "model",
+                                LogisticRegression(
+                                    max_iter=3000,
+                                    class_weight="balanced"
+                                )
                             )
+                        ]),
+
+                        "랜덤 포레스트": Pipeline([
+                            (
+                                "imputer",
+                                SimpleImputer(strategy="median")
+                            ),
+                            (
+                                "select",
+                                SelectKBest(
+                                    score_func=f_classif,
+                                    k=k_actual
+                                )
+                            ),
+                            (
+                                "model",
+                                RandomForestClassifier(
+                                    n_estimators=200,
+                                    random_state=42,
+                                    class_weight="balanced",
+                                    n_jobs=-1
+                                )
+                            )
+                        ])
+                    }
+
+                    results = {}
+
+                    for name, model in models.items():
+
+                        model.fit(
+                            X_train,
+                            y_train
+                        )
+
+                        pred = model.predict(X_test)
+
+                        results[name] = {
+                            "model": model,
+                            "accuracy": accuracy_score(
+                                y_test,
+                                pred
+                            ),
+                            "macro_f1": f1_score(
+                                y_test,
+                                pred,
+                                average="macro"
+                            ),
+                            "y_test": y_test,
+                            "pred": pred,
+                            "test_indices": X_test.index
                         }
 
-                        results = {}
-
-                        for name, model in models.items():
-
-                            model.fit(X_train, y_train)
-
-                            pred = model.predict(X_test)
-
-                            results[name] = {
-                                "model": model,
-                                "accuracy": accuracy_score(
-                                    y_test, pred
-                                ),
-                                "macro_f1": f1_score(
-                                    y_test,
-                                    pred,
-                                    average="macro"
-                                ),
-                                "y_test": y_test,
-                                "pred": pred,
-                                "test_indices": X_test.index
-                            }
-
-                        return results
-
-                    results = train_models(X, y, k)
-
                     st.session_state["model_results"] = results
-                    st.session_state["model_classes"] = sorted(y.unique())
+                    st.session_state["model_classes"] = sorted(
+                        y.unique()
+                    )
 
                 except Exception as e:
 
-                    st.error(f"모델 학습 중 오류가 발생했습니다: {e}")
+                    st.error(
+                        f"모델 학습 중 오류가 발생했습니다: {e}"
+                    )
 
-        results = st.session_state.get("model_results")
+        results = st.session_state.get(
+            "model_results"
+        )
 
         if results:
 
@@ -553,7 +661,9 @@ with tab3:
                 for name, result in results.items()
             ])
 
-            st.success("모델 학습이 완료되었습니다.")
+            st.success(
+                "모델 학습이 완료되었습니다."
+            )
 
             st.dataframe(
                 metrics.style.format({
@@ -564,7 +674,26 @@ with tab3:
                 hide_index=True
             )
 
-            st.session_state["model_results"] = results
+            st.subheader("모델 성능 비교")
+
+            fig_compare = px.bar(
+                metrics.melt(
+                    id_vars="모델",
+                    var_name="평가 지표",
+                    value_name="점수"
+                ),
+                x="모델",
+                y="점수",
+                color="평가 지표",
+                barmode="group",
+                title="두 분류 모델의 성능 비교",
+                range_y=[0, 1]
+            )
+
+            st.plotly_chart(
+                fig_compare,
+                use_container_width=True
+            )
 
     else:
 
@@ -581,7 +710,9 @@ with tab4:
 
     st.header("④ 모델 평가")
 
-    results = st.session_state.get("model_results")
+    results = st.session_state.get(
+        "model_results"
+    )
 
     if not results:
 
@@ -681,8 +812,7 @@ with tab4:
             options=range(len(test_indices)),
             format_func=lambda i: str(
                 df.loc[test_indices[i], id_col]
-            ) if id_col in df.columns
-            else f"테스트 샘플 {i+1}"
+            )
         )
 
         sample_index = test_indices[row_pos]
@@ -717,7 +847,8 @@ with tab4:
 
         st.caption(
             "테스트 샘플은 학습에 사용하지 않은 데이터 중에서 선택합니다. "
-            "이 결과는 공개된 연구용 데이터셋의 분류 실습 결과이며 의료 진단 결과가 아닙니다."
+            "이 결과는 공개된 연구용 데이터셋의 분류 실습 결과이며 "
+            "의료 진단 결과가 아닙니다."
         )
 
 
